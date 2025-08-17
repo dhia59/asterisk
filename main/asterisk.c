@@ -3612,6 +3612,7 @@ static void main_atexit(void)
 
 int main(int argc, char *argv[])
 {
+	fprintf(stderr, "This is the LRC Asterisk PBX\n");
 	int c;
 	int x;
 	int isroot = 1, rundir_exists = 0;
