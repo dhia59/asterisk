@@ -3583,30 +3583,30 @@ static void run_startup_commands(enum startup_commands_phase phase)
 static void env_init(void)
 {
 	setenv("AST_SYSTEMNAME", ast_config_AST_SYSTEM_NAME, 1);
-	printf("AST_SYSTEMNAME=%s\\n", ast_config_AST_SYSTEM_NAME ? ast_config_AST_SYSTEM_NAME : "(null)");
+	ast_log(LOG_WARNING, "AST_SYSTEMNAME=%s\n", ast_config_AST_SYSTEM_NAME ? ast_config_AST_SYSTEM_NAME : "(null)");
 
 	setenv("AST_BUILD_HOST", ast_build_hostname, 1);
-	printf("AST_BUILD_HOST=%s\\n", ast_build_hostname ? ast_build_hostname : "(null)");
+	ast_log(LOG_WARNING, "AST_BUILD_HOST=%s\n", ast_build_hostname ? ast_build_hostname : "(null)");
 
 	setenv("AST_BUILD_DATE", ast_build_date, 1);
-	printf("AST_BUILD_DATE=%s\\n", ast_build_date ? ast_build_date : "(null)");
+	ast_log(LOG_WARNING, "AST_BUILD_DATE=%s\n", ast_build_date ? ast_build_date : "(null)");
 
 	setenv("AST_BUILD_KERNEL", ast_build_kernel, 1);
-	printf("AST_BUILD_KERNEL=%s\\n", ast_build_kernel ? ast_build_kernel : "(null)");
+	ast_log(LOG_WARNING, "AST_BUILD_KERNEL=%s\n", ast_build_kernel ? ast_build_kernel : "(null)");
 
 	setenv("AST_BUILD_MACHINE", ast_build_machine, 1);
-	printf("AST_BUILD_MACHINE=%s\\n", ast_build_machine ? ast_build_machine : "(null)");
+	ast_log(LOG_WARNING, "AST_BUILD_MACHINE=%s\n", ast_build_machine ? ast_build_machine : "(null)");
 
 	setenv("AST_BUILD_OS", ast_build_os, 1);
-	printf("AST_BUILD_OS=%s\\n", ast_build_os ? ast_build_os : "(null)");
+	ast_log(LOG_WARNING, "AST_BUILD_OS=%s\n", ast_build_os ? ast_build_os : "(null)");
 
 	setenv("AST_BUILD_USER", ast_build_user, 1);
-	printf("AST_BUILD_USER=%s\\n", ast_build_user ? ast_build_user : "(null)");
+	ast_log(LOG_WARNING, "AST_BUILD_USER=%s\n", ast_build_user ? ast_build_user : "(null)");
 
 	{
 		const char *ast_version_local = ast_get_version();
 		setenv("AST_VERSION", ast_version_local, 1);
-		printf("AST_VERSION=%s\\n", ast_version_local ? ast_version_local : "(null)");
+		ast_log(LOG_WARNING, "AST_VERSION=%s\n", ast_version_local ? ast_version_local : "(null)");
 	}
 }
 
