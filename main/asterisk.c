@@ -3885,6 +3885,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "The 'languageprefix' option in asterisk.conf is deprecated; in a future release it will be removed, and your sound files will need to be organized in the 'new style' language layout.\n");
 	}
 
+
 	if (ast_opt_always_fork && (ast_opt_remote || ast_opt_console)) {
 		fprintf(stderr, "'alwaysfork' is not compatible with console or remote console mode; ignored\n");
 		ast_clear_flag64(&ast_options, AST_OPT_FLAG_ALWAYS_FORK);
