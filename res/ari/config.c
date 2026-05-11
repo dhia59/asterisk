@@ -119,6 +119,11 @@ static int outbound_websocket_apply(const struct ast_sorcery *sorcery, void *obj
 
 	ast_debug(3, "%s: Initializing outbound websocket\n", id);
 
+	if (!owc->websocket_client) {
+		ast_log(LOG_WARNING, "%s: Outbound websocket missing websocket_client_id\n", id);
+		res = -1;
+	}
+
 	if (ast_strlen_zero(owc->apps)) {
 		ast_log(LOG_WARNING, "%s: Outbound websocket missing apps\n", id);
 		res = -1;
@@ -500,6 +505,7 @@ static void user_dtor(void *obj)
 {
 	struct ari_conf_user *user = obj;
 	ast_string_field_free_memory(user);
+	user->acl = ast_free_acl_list(user->acl);
 	ast_debug(3, "%s: Disposing of user\n", ast_sorcery_object_get_id(user));
 }
 
@@ -551,6 +557,23 @@ static int user_password_format_from_str(const struct aco_option *opt,
 	}
 
 	return 0;
+}
+
+/*! \brief Handler for user ACL options */
+static int user_acl_handler(const struct aco_option *opt,
+	struct ast_variable *var, void *obj)
+{
+	struct ari_conf_user *user = obj;
+	int error = 0;
+	int ignore;
+
+	ast_append_acl(var->name, var->value, &user->acl, &error, &ignore);
+	if (error) {
+		ast_log(LOG_ERROR, "Bad ACL '%s' at line '%d' of ari.conf\n",
+			var->value, var->lineno);
+	}
+
+	return error;
 }
 
 static int user_password_format_to_str(const void *obj, const intptr_t *args, char **buf)
@@ -724,6 +747,9 @@ static int ari_conf_init(void)
 	ast_sorcery_register_sf(user, ari_conf_user, password, password, "");
 	ast_sorcery_register_bool(user, ari_conf_user, read_only, read_only, "no");
 	ast_sorcery_register_cust(user, password_format, "plain");
+	ast_sorcery_object_field_register_custom(sorcery, "user", "permit", "", user_acl_handler, NULL, NULL, 0, 0);
+	ast_sorcery_object_field_register_custom(sorcery, "user", "deny", "", user_acl_handler, NULL, NULL, 0, 0);
+	ast_sorcery_object_field_register_custom(sorcery, "user", "acl", "", user_acl_handler, NULL, NULL, 0, 0);
 
 	ast_sorcery_object_field_register(sorcery, "outbound_websocket", "type", "", OPT_NOOP_T, 0, 0);
 	ast_sorcery_register_cust(outbound_websocket, websocket_client_id, "");

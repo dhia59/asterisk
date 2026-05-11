@@ -28,6 +28,7 @@
 #include <time.h>	/* we want to override localtime_r */
 #include <unistd.h>
 #include <string.h>
+#include "asterisk/endian.h"
 
 #include "asterisk/lock.h"
 #include "asterisk/time.h"
@@ -126,10 +127,12 @@ extern unsigned int __unsigned_int_flags_dummy;
  * \param flags The 64-bit flags to swap
  * \retval The flags with the upper and lower 32 bits swapped if the system is big-endian,
  */
-#if __BYTE_ORDER == __BIG_ENDIAN
+#if defined(BYTE_ORDER) && (BYTE_ORDER == BIG_ENDIAN)
 #define SWAP64_32(flags) (((uint64_t)flags << 32) | ((uint64_t)flags >> 32))
-#else
+#elif defined(BYTE_ORDER) && (BYTE_ORDER == LITTLE_ENDIAN)
 #define SWAP64_32(flags) (flags)
+#else
+#error "Endianness not known - endian.h broken?"
 #endif
 
 extern uint64_t __unsigned_int_flags_dummy64;
@@ -418,6 +421,19 @@ char *ast_uri_encode(const char *string, char *outbuf, int buflen, struct ast_fl
  * \param spec flags describing how the decoding should be performed
  */
 void ast_uri_decode(char *s, struct ast_flags spec);
+
+/*!
+ * \brief Verify if a string is valid as a URI component
+ *
+ * This function checks if the string either doesn't need encoding
+ * or is already properly URI encoded.
+ * Valid characters are 'a-zA-Z0-9.+_-' and '%xx' escape sequences.
+ *
+ * \param string String to be checked
+ * \retval 1 if the string is valid
+ * \retval 0 if the string is not valid
+ */
+int ast_uri_verify_encoded(const char *string);
 
 /*! ast_xml_escape
 	\brief Escape reserved characters for use in XML.
@@ -753,7 +769,7 @@ void DO_CRASH_NORETURN __ast_assert_failed(int condition, const char *condition_
 		return __VA_ARGS__; \
 	}\
 })
-static void force_inline _ast_assert(int condition, const char *condition_str, const char *file, int line, const char *function)
+static force_inline void _ast_assert(int condition, const char *condition_str, const char *file, int line, const char *function)
 {
 	if (__builtin_expect(!condition, 1)) {
 		__ast_assert_failed(condition, condition_str, file, line, function);

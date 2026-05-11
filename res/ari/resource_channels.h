@@ -358,6 +358,19 @@ struct ast_ari_channels_ring_stop_args {
  * \param[out] response HTTP response
  */
 void ast_ari_channels_ring_stop(struct ast_variable *headers, struct ast_ari_channels_ring_stop_args *args, struct ast_ari_response *response);
+/*! Argument struct for ast_ari_channels_progress() */
+struct ast_ari_channels_progress_args {
+	/*! Channel's id */
+	const char *channel_id;
+};
+/*!
+ * \brief Indicate progress on a channel.
+ *
+ * \param headers HTTP headers
+ * \param args Swagger parameters
+ * \param[out] response HTTP response
+ */
+void ast_ari_channels_progress(struct ast_variable *headers, struct ast_ari_channels_progress_args *args, struct ast_ari_response *response);
 /*! Argument struct for ast_ari_channels_send_dtmf() */
 struct ast_ari_channels_send_dtmf_args {
 	/*! Channel's id */
@@ -848,6 +861,8 @@ struct ast_ari_channels_external_media_args {
 	const char *direction;
 	/*! An arbitrary data field */
 	const char *data;
+	/*! Transport-specific data. For websocket this is appended to the dialstring. */
+	const char *transport_data;
 };
 /*!
  * \brief Body parsing function for /channels/externalMedia.

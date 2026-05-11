@@ -40,6 +40,7 @@
 #include "asterisk/http_websocket.h"
 #include "asterisk/format_cache.h"
 #include "asterisk/frame.h"
+#include "asterisk/json.h"
 #include "asterisk/lock.h"
 #include "asterisk/mod_format.h"
 #include "asterisk/module.h"
@@ -48,6 +49,39 @@
 #include "asterisk/timing.h"
 #include "asterisk/translate.h"
 #include "asterisk/websocket_client.h"
+#include "asterisk/sorcery.h"
+
+static struct ast_sorcery *sorcery = NULL;
+
+enum webchan_control_msg_format {
+	WEBCHAN_CONTROL_MSG_FORMAT_PLAIN = 0,
+	WEBCHAN_CONTROL_MSG_FORMAT_JSON,
+	WEBCHAN_CONTROL_MSG_FORMAT_INVALID,
+};
+
+static const char *msg_format_map[] = {
+	[WEBCHAN_CONTROL_MSG_FORMAT_PLAIN] = "plain-text",
+	[WEBCHAN_CONTROL_MSG_FORMAT_JSON] = "json",
+	[WEBCHAN_CONTROL_MSG_FORMAT_INVALID] = "invalid",
+};
+
+struct webchan_conf_global {
+	SORCERY_OBJECT(details);
+	enum webchan_control_msg_format control_msg_format;
+};
+
+/* This is from the perspective of the app, NOT Asterisk */
+enum webchan_media_direction {
+	WEBCHAN_MEDIA_DIRECTION_BOTH,
+	WEBCHAN_MEDIA_DIRECTION_OUT,
+	WEBCHAN_MEDIA_DIRECTION_IN,
+};
+
+static const char *websocket_media_direction_map[] = {
+	[WEBCHAN_MEDIA_DIRECTION_BOTH] = "both",
+	[WEBCHAN_MEDIA_DIRECTION_OUT] = "out",
+	[WEBCHAN_MEDIA_DIRECTION_IN] = "in",
+};
 
 static struct ast_websocket_server *ast_ws_server;
 
@@ -59,26 +93,34 @@ struct websocket_pvt {
 	struct ast_websocket *websocket;
 	struct ast_format *native_format;
 	struct ast_codec *native_codec;
-	struct ast_format *slin_format;
-	struct ast_codec *slin_codec;
 	struct ast_channel *channel;
 	struct ast_timer *timer;
-	struct ast_frame silence;
-	struct ast_trans_pvt *translator;
 	AST_LIST_HEAD(, ast_frame) frame_queue;
 	pthread_t outbound_read_thread;
 	size_t bytes_read;
 	size_t leftover_len;
+	char *remote_addr;
+	char *uri_params;
 	char *leftover_data;
+	enum webchan_control_msg_format control_msg_format;
 	int no_auto_answer;
+	int passthrough;
 	int optimal_frame_size;
 	int bulk_media_in_progress;
 	int report_queue_drained;
 	int frame_queue_length;
 	int queue_full;
 	int queue_paused;
+	int media_direction;
 	char connection_id[0];
 };
+
+/*
+ * These are the indexes in the channel's file descriptor array
+ * not the file descriptors themselves.
+ */
+#define WS_TIMER_FDNO (AST_EXTENDED_FDS + 1)
+#define WS_WEBSOCKET_FDNO (AST_EXTENDED_FDS + 2)
 
 #define MEDIA_WEBSOCKET_OPTIMAL_FRAME_SIZE "MEDIA_WEBSOCKET_OPTIMAL_FRAME_SIZE"
 #define MEDIA_WEBSOCKET_CONNECTION_ID "MEDIA_WEBSOCKET_CONNECTION_ID"
@@ -88,18 +130,13 @@ struct websocket_pvt {
 #define HANGUP_CHANNEL "HANGUP"
 #define START_MEDIA_BUFFERING "START_MEDIA_BUFFERING"
 #define STOP_MEDIA_BUFFERING "STOP_MEDIA_BUFFERING"
+#define MARK_MEDIA "MARK_MEDIA"
 #define FLUSH_MEDIA "FLUSH_MEDIA"
 #define GET_DRIVER_STATUS "GET_STATUS"
 #define REPORT_QUEUE_DRAINED "REPORT_QUEUE_DRAINED"
 #define PAUSE_MEDIA "PAUSE_MEDIA"
 #define CONTINUE_MEDIA "CONTINUE_MEDIA"
-
-#define MEDIA_START "MEDIA_START"
-#define MEDIA_XON "MEDIA_XON"
-#define MEDIA_XOFF "MEDIA_XOFF"
-#define QUEUE_DRAINED "QUEUE_DRAINED"
-#define DRIVER_STATUS "STATUS"
-#define MEDIA_BUFFERING_COMPLETED "MEDIA_BUFFERING_COMPLETED"
+#define SET_MEDIA_DIRECTION "SET_MEDIA_DIRECTION"
 
 #define QUEUE_LENGTH_MAX 1000
 #define QUEUE_LENGTH_XOFF_LEVEL 900
@@ -107,11 +144,19 @@ struct websocket_pvt {
 #define MAX_TEXT_MESSAGE_LEN MIN(128, (AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE - 1))
 
 /* Forward declarations */
+static int read_from_ws_and_queue(struct websocket_pvt *instance);
+static void _websocket_request_hangup(struct websocket_pvt *instance, int ast_cause,
+	enum ast_websocket_status_code tech_cause, int line, const char *function);
 static struct ast_channel *webchan_request(const char *type, struct ast_format_cap *cap, const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor, const char *data, int *cause);
 static int webchan_call(struct ast_channel *ast, const char *dest, int timeout);
 static struct ast_frame *webchan_read(struct ast_channel *ast);
 static int webchan_write(struct ast_channel *ast, struct ast_frame *f);
 static int webchan_hangup(struct ast_channel *ast);
+static int webchan_send_dtmf_text(struct ast_channel *ast, char digit, unsigned int duration);
+static int set_channel_timer(struct websocket_pvt *instance);
+
+#define websocket_request_hangup(_instance, _cause, _tech) \
+	_websocket_request_hangup(_instance, _cause, _tech, __LINE__, __FUNCTION__)
 
 static struct ast_channel_tech websocket_tech = {
 	.type = "WebSocket",
@@ -121,17 +166,295 @@ static struct ast_channel_tech websocket_tech = {
 	.read = webchan_read,
 	.write = webchan_write,
 	.hangup = webchan_hangup,
+	.send_digit_end = webchan_send_dtmf_text,
 };
 
-static void set_channel_format(struct websocket_pvt * instance,
-	struct ast_format *fmt)
+static enum webchan_control_msg_format control_msg_format_from_str(const char *value)
 {
-	if (ast_format_cmp(ast_channel_rawreadformat(instance->channel), fmt)
-		== AST_FORMAT_CMP_NOT_EQUAL) {
-		ast_channel_set_rawreadformat(instance->channel, fmt);
-		ast_debug(4, "Switching readformat to %s\n", ast_format_get_name(fmt));
+	if (ast_strlen_zero(value)) {
+		return WEBCHAN_CONTROL_MSG_FORMAT_INVALID;
+	} else if (strcasecmp(value, msg_format_map[WEBCHAN_CONTROL_MSG_FORMAT_PLAIN]) == 0) {
+		return WEBCHAN_CONTROL_MSG_FORMAT_PLAIN;
+	} else if (strcasecmp(value, msg_format_map[WEBCHAN_CONTROL_MSG_FORMAT_JSON]) == 0) {
+		return WEBCHAN_CONTROL_MSG_FORMAT_JSON;
+	} else {
+		return WEBCHAN_CONTROL_MSG_FORMAT_INVALID;
 	}
 }
+
+static const char *control_msg_format_to_str(enum webchan_control_msg_format value)
+{
+	if (!ARRAY_IN_BOUNDS(value, msg_format_map)) {
+		return NULL;
+	}
+	return msg_format_map[value];
+}
+
+/*!
+ * \internal
+ * \brief Catch-all to print events that don't have any data.
+ * \warning Do not call directly.
+ */
+static char *_create_event_nodata(struct websocket_pvt *instance, char *event)
+{
+	char *payload = NULL;
+	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+		struct ast_json * msg = ast_json_pack("{ s:s s:s }",
+			"event", event,
+			"channel_id", ast_channel_uniqueid(instance->channel));
+		if (!msg) {
+			return NULL;
+		}
+		payload = ast_json_dump_string_format(msg, AST_JSON_COMPACT);
+		ast_json_unref(msg);
+	} else {
+		payload = ast_strdup(event);
+	}
+
+	return payload;
+}
+
+#define _create_event_MEDIA_XON(_instance) _create_event_nodata(_instance, "MEDIA_XON");
+#define _create_event_MEDIA_XOFF(_instance) _create_event_nodata(_instance, "MEDIA_XOFF");
+#define _create_event_QUEUE_DRAINED(_instance) _create_event_nodata(_instance, "QUEUE_DRAINED");
+
+/*!
+ * \internal
+ * \brief Print the MEDIA_START event.
+ * \warning Do not call directly.
+ */
+static char *_create_event_MEDIA_START(struct websocket_pvt *instance)
+{
+	char *payload = NULL;
+
+	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+		struct ast_json *msg = ast_json_pack("{s:s, s:s, s:s, s:s, s:s, s:i, s:i, s:o }",
+			"event", "MEDIA_START",
+			"connection_id", instance->connection_id,
+			"channel", ast_channel_name(instance->channel),
+			"channel_id", ast_channel_uniqueid(instance->channel),
+			"format", ast_format_get_name(instance->native_format),
+			"optimal_frame_size", instance->optimal_frame_size,
+			"ptime", instance->native_codec->default_ms,
+			"channel_variables", ast_json_channel_vars(ast_channel_varshead(
+						instance->channel))
+			);
+		if (!msg) {
+			return NULL;
+		}
+		payload = ast_json_dump_string_format(msg, AST_JSON_COMPACT);
+		ast_json_unref(msg);
+	} else {
+		ast_asprintf(&payload, "%s %s:%s %s:%s %s:%s %s:%s %s:%d %s:%d",
+			"MEDIA_START",
+			"connection_id", instance->connection_id,
+			"channel", ast_channel_name(instance->channel),
+			"channel_id", ast_channel_uniqueid(instance->channel),
+			"format", ast_format_get_name(instance->native_format),
+			"optimal_frame_size", instance->optimal_frame_size,
+			"ptime", instance->native_codec->default_ms
+			);
+	}
+
+	return payload;
+}
+
+/*!
+ * \internal
+ * \brief Print the MEDIA_BUFFERING_COMPLETED event.
+ * \warning Do not call directly.
+ */
+static char *_create_event_MEDIA_BUFFERING_COMPLETED(struct websocket_pvt *instance,
+	const char *id)
+{
+	char *payload = NULL;
+	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+		struct ast_json *msg = ast_json_pack("{s:s, s:s, s:s}",
+			"event", "MEDIA_BUFFERING_COMPLETED",
+			"channel_id", ast_channel_uniqueid(instance->channel),
+			"correlation_id", S_OR(id, "")
+			);
+		if (!msg) {
+			return NULL;
+		}
+		payload = ast_json_dump_string_format(msg, AST_JSON_COMPACT);
+		ast_json_unref(msg);
+	} else {
+		ast_asprintf(&payload, "%s%s%s",
+			"MEDIA_BUFFERING_COMPLETED",
+			S_COR(id, " ",""), S_OR(id, ""));
+
+	}
+
+	return payload;
+}
+
+/*!
+ * \internal
+ * \brief Print the MEDIA_MARK_PROCESSED event.
+ * \warning Do not call directly.
+ */
+static char *_create_event_MEDIA_MARK_PROCESSED(struct websocket_pvt *instance,
+	const char *id)
+{
+	char *payload = NULL;
+	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+		struct ast_json *msg = ast_json_pack("{s:s, s:s, s:s}",
+			"event", "MEDIA_MARK_PROCESSED",
+			"channel_id", ast_channel_uniqueid(instance->channel),
+			"correlation_id", S_OR(id, "")
+			);
+		if (!msg) {
+			return NULL;
+		}
+		payload = ast_json_dump_string_format(msg, AST_JSON_COMPACT);
+		ast_json_unref(msg);
+	} else {
+		ast_asprintf(&payload, "%s%s%s",
+			"MEDIA_MARK_PROCESSED",
+			S_COR(id, " ",""), S_OR(id, ""));
+
+	}
+
+	return payload;
+}
+
+/*!
+ * \internal
+ * \brief Print the DTMF_END event.
+ * \warning Do not call directly.
+ */
+static char *_create_event_DTMF_END(struct websocket_pvt *instance,
+	const char digit)
+{
+	char *payload = NULL;
+	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+		struct ast_json *msg = ast_json_pack("{s:s, s:s, s:s#}",
+			"event", "DTMF_END",
+			"channel_id", ast_channel_uniqueid(instance->channel),
+			"digit", &digit, 1
+			);
+		if (!msg) {
+			return NULL;
+		}
+		payload = ast_json_dump_string_format(msg, AST_JSON_COMPACT);
+		ast_json_unref(msg);
+	} else {
+		ast_asprintf(&payload, "%s digit:%c channel_id:%s",
+			"DTMF_END", digit, ast_channel_uniqueid(instance->channel));
+	}
+
+	return payload;
+}
+
+/*!
+ * \internal
+ * \brief Print the STATUS event.
+ * \warning Do not call directly.
+ */
+static char *_create_event_STATUS(struct websocket_pvt *instance)
+{
+	char *payload = NULL;
+
+	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+		struct ast_json *msg = ast_json_pack("{s:s, s:s, s:i, s:i, s:i, s:b, s:b, s:b }",
+			"event", "STATUS",
+			"channel_id", ast_channel_uniqueid(instance->channel),
+			"queue_length", instance->frame_queue_length,
+			"xon_level", QUEUE_LENGTH_XON_LEVEL,
+			"xoff_level", QUEUE_LENGTH_XOFF_LEVEL,
+			"queue_full", instance->queue_full,
+			"bulk_media", instance->bulk_media_in_progress,
+			"media_paused", instance->queue_paused
+			);
+		if (!msg) {
+			return NULL;
+		}
+		payload = ast_json_dump_string_format(msg, AST_JSON_COMPACT);
+		ast_json_unref(msg);
+	} else {
+		ast_asprintf(&payload, "%s channel_id:%s queue_length:%d xon_level:%d xoff_level:%d queue_full:%s bulk_media:%s media_paused:%s",
+			"STATUS",
+			ast_channel_uniqueid(instance->channel),
+			instance->frame_queue_length, QUEUE_LENGTH_XON_LEVEL,
+			QUEUE_LENGTH_XOFF_LEVEL,
+			S_COR(instance->queue_full, "true", "false"),
+			S_COR(instance->bulk_media_in_progress, "true", "false"),
+			S_COR(instance->queue_paused, "true", "false")
+			);
+	}
+
+	return payload;
+}
+
+/*!
+ * \internal
+ * \brief Print the ERROR event.
+ * \warning Do not call directly.
+ */
+static __attribute__ ((format (gnu_printf, 2, 3))) char *_create_event_ERROR(
+	struct websocket_pvt *instance, const char *format, ...)
+{
+	char *payload = NULL;
+	char *error_text = NULL;
+	va_list ap;
+	int res = 0;
+
+	va_start(ap, format);
+	res = ast_vasprintf(&error_text, format, ap);
+	va_end(ap);
+	if (res < 0 || !error_text) {
+		return NULL;
+	}
+
+	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+		struct ast_json *msg = ast_json_pack("{s:s, s:s, s:s}",
+			"event", "ERROR",
+			"channel_id", ast_channel_uniqueid(instance->channel),
+			"error_text", error_text);
+		ast_free(error_text);
+		if (!msg) {
+			return NULL;
+		}
+		payload = ast_json_dump_string_format(msg, AST_JSON_COMPACT);
+		ast_json_unref(msg);
+	} else {
+		ast_asprintf(&payload, "%s channel_id:%s error_text:%s",
+			"ERROR", ast_channel_uniqueid(instance->channel), error_text);
+		ast_free(error_text);
+	}
+
+	return payload;
+}
+
+/*!
+ * \def create_event
+ * \brief Use this macro to create events passing in any event-specific parameters.
+ */
+#define create_event(_instance, _event, ...) \
+	_create_event_ ## _event(_instance, ##__VA_ARGS__)
+
+/*!
+ * \def send_event
+ * \brief Use this macro to create and send events passing in any event-specific parameters.
+ */
+#define send_event(_instance, _event, ...) \
+({ \
+	int _res = -1; \
+	char *_payload = _create_event_ ## _event(_instance, ##__VA_ARGS__); \
+	if (_payload && _instance->websocket) { \
+		_res = ast_websocket_write_string(_instance->websocket, _payload); \
+		if (_res != 0) { \
+			ast_log(LOG_ERROR, "%s: Unable to send event %s\n", \
+				ast_channel_name(instance->channel), _payload); \
+		} else { \
+			ast_debug(3, "%s: Sent %s\n", \
+				ast_channel_name(instance->channel), _payload); \
+		}\
+		ast_free(_payload); \
+	} \
+	(_res); \
+})
 
 /*
  * Reminder...  This function gets called by webchan_read which is
@@ -164,7 +487,7 @@ static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 		instance->queue_full = 0;
 		ast_debug(4, "%s: WebSocket sending MEDIA_XON\n",
 			ast_channel_name(instance->channel));
-		ast_websocket_write_string(instance->websocket, MEDIA_XON);
+		send_event(instance, MEDIA_XON);
 	}
 
 	queued_frame = AST_LIST_REMOVE_HEAD(&instance->frame_queue, frame_list);
@@ -180,7 +503,7 @@ static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 			instance->report_queue_drained = 0;
 			ast_debug(4, "%s: WebSocket sending QUEUE_DRAINED\n",
 				ast_channel_name(instance->channel));
-			ast_websocket_write_string(instance->websocket, QUEUE_DRAINED);
+			send_event(instance, QUEUE_DRAINED);
 		}
 		return NULL;
 	}
@@ -208,7 +531,7 @@ static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 			 */
 			ast_websocket_write_string(instance->websocket,
 				queued_frame->data.ptr);
-			ast_debug(4, "%s: WebSocket sending %s\n",
+			ast_debug(4, "%s: Sent %s\n",
 				ast_channel_name(instance->channel), (char *)queued_frame->data.ptr);
 		}
 		/*
@@ -241,18 +564,35 @@ static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 /*!
  * \internal
  *
- * Called by the core channel thread each time the instance timer fires.
+ * There are two file descriptors on this channel that can trigger
+ * this function...
+ *
+ *   The timer fd (WS_TIMER_FDNO) which gets triggered at a constant
+ *   rate determined by the format.  In this case, we need to pull a
+ *   frame OFF the queue and return it to the core.
+ *
+ *   The websocket fd (WS_WEBSOCKET_FDNO) which gets triggered when
+ *   there's incoming data to read from the websocket.  In this case,
+ *   we read the data and put it ON the queue.  We'll return a null frame.
  *
  */
 static struct ast_frame *webchan_read(struct ast_channel *ast)
 {
 	struct websocket_pvt *instance = NULL;
 	struct ast_frame *native_frame = NULL;
-	struct ast_frame *slin_frame = NULL;
+	int fdno = ast_channel_fdno(ast);
 
 	instance = ast_channel_tech_pvt(ast);
 	if (!instance) {
 		return NULL;
+	}
+
+	if (fdno == WS_WEBSOCKET_FDNO) {
+		read_from_ws_and_queue(instance);
+		return &ast_null_frame;
+	}
+	if (fdno != WS_TIMER_FDNO) {
+		return &ast_null_frame;
 	}
 
 	if (ast_timer_get_event(instance->timer) == AST_TIMING_EVENT_EXPIRED) {
@@ -262,86 +602,15 @@ static struct ast_frame *webchan_read(struct ast_channel *ast)
 	native_frame = dequeue_frame(instance);
 
 	/*
-	 * No frame when the timer fires means we have to create and
-	 * return a silence frame in its place.
+	 * No frame when the timer fires means we have to return a null frame in its place.
 	 */
 	if (!native_frame) {
-		ast_debug(5, "%s: WebSocket read timer fired with no frame available.  Returning silence.\n", ast_channel_name(ast));
-		set_channel_format(instance, instance->slin_format);
-		slin_frame = ast_frdup(&instance->silence);
-		return slin_frame;
+		ast_debug(4, "%s: WebSocket read timer fired with no frame available.  Returning NULL frame.\n",
+			ast_channel_name(ast));
+		return &ast_null_frame;
 	}
 
-	/*
-	 * If the frame length is already optimal_frame_size, we can just
-	 * return it.
-	 */
-	if (native_frame->datalen == instance->optimal_frame_size) {
-		set_channel_format(instance, instance->native_format);
-		return native_frame;
-	}
-
-	/*
-	 * If we're here, we have a short frame that we need to pad
-	 * with silence.
-	 */
-
-	if (instance->translator) {
-		slin_frame = ast_translate(instance->translator, native_frame, 0);
-		if (!slin_frame) {
-			ast_log(LOG_WARNING, "%s: Failed to translate %d byte frame\n",
-				ast_channel_name(ast), native_frame->datalen);
-			return NULL;
-		}
-		ast_frame_free(native_frame, 0);
-	} else {
-		/*
-		 * If there was no translator then the native format
-		 * was already slin.
-		 */
-		slin_frame = native_frame;
-	}
-
-	set_channel_format(instance, instance->slin_format);
-
-	/*
-	 * So now we have an slin frame but it's probably still short
-	 * so we create a new data buffer with the correct length
-	 * which is filled with zeros courtesy of ast_calloc.
-	 * We then copy the short frame data into the new buffer
-	 * and set the offset to AST_FRIENDLY_OFFSET so that
-	 * the core can read the data without any issues.
-	 * If the original frame data was mallocd, we need to free the old
-	 * data buffer so we don't leak memory and we need to set
-	 * mallocd to AST_MALLOCD_DATA so that the core knows
-	 * it needs to free the new data buffer when it's done.
-	 */
-
-	if (slin_frame->datalen != instance->silence.datalen) {
-		char *old_data = slin_frame->data.ptr;
-		int old_len = slin_frame->datalen;
-		int old_offset = slin_frame->offset;
-		ast_debug(4, "%s: WebSocket read short frame. Expected %d got %d.  Filling with silence\n",
-			ast_channel_name(ast), instance->silence.datalen,
-			slin_frame->datalen);
-
-		slin_frame->data.ptr = ast_calloc(1, instance->silence.datalen + AST_FRIENDLY_OFFSET);
-		if (!slin_frame->data.ptr) {
-			ast_frame_free(slin_frame, 0);
-			return NULL;
-		}
-		slin_frame->data.ptr += AST_FRIENDLY_OFFSET;
-		slin_frame->offset = AST_FRIENDLY_OFFSET;
-		memcpy(slin_frame->data.ptr, old_data, old_len);
-		if (slin_frame->mallocd & AST_MALLOCD_DATA) {
-			ast_free(old_data - old_offset);
-		}
-		slin_frame->mallocd |= AST_MALLOCD_DATA;
-		slin_frame->datalen = instance->silence.datalen;
-		slin_frame->samples = instance->silence.samples;
-	}
-
-	return slin_frame;
+	return native_frame;
 }
 
 static int queue_frame_from_buffer(struct websocket_pvt *instance,
@@ -369,9 +638,7 @@ static int queue_frame_from_buffer(struct websocket_pvt *instance,
 		instance->frame_queue_length++;
 		if (!instance->queue_full && instance->frame_queue_length >= QUEUE_LENGTH_XOFF_LEVEL) {
 			instance->queue_full = 1;
-			ast_debug(4, "%s: WebSocket sending %s\n",
-				ast_channel_name(instance->channel), MEDIA_XOFF);
-			ast_websocket_write_string(instance->websocket, MEDIA_XOFF);
+			send_event(instance, MEDIA_XOFF);
 		}
 	}
 
@@ -408,47 +675,88 @@ static int queue_option_frame(struct websocket_pvt *instance,
 	return 0;
 }
 
-static int process_text_message(struct websocket_pvt *instance,
-	char *payload, uint64_t payload_len)
+#define ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command) \
+({ \
+	if (instance->passthrough) { \
+		send_event(instance, ERROR, "%s not supported in passthrough mode", command); \
+		ast_debug(4, "%s: WebSocket in passthrough mode. Ignoring %s command.\n", \
+			ast_channel_name(instance->channel), command); \
+		return 0; \
+	} \
+})
+
+#define ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, direction) \
+({ \
+	if (instance->media_direction == direction) { \
+		send_event(instance, ERROR, "%s not supported while media direction " \
+			"is '%s'", command, websocket_media_direction_map[direction]); \
+		ast_debug(4, "%s: WebSocket media direction is '%s'. Ignoring %s command.\n", \
+			ast_channel_name(instance->channel), websocket_media_direction_map[direction], command); \
+		return 0; \
+	} \
+})
+
+/*!
+ * \internal
+ * \brief Handle commands from the websocket
+ *
+ * \param instance
+ * \param buffer Allocated by caller so don't free.
+ * \retval 0 Success
+ * \retval -1 Failure
+ */
+static int handle_command(struct websocket_pvt *instance, char *buffer)
 {
 	int res = 0;
-	char *command;
+	RAII_VAR(struct ast_json *, json, NULL, ast_json_unref);
+	const char *command = NULL;
+	char *data = NULL;
 
-	if (payload_len > MAX_TEXT_MESSAGE_LEN) {
-		ast_log(LOG_WARNING, "%s: WebSocket TEXT message of length %d exceeds maximum length of %d\n",
-			ast_channel_name(instance->channel), (int)payload_len, MAX_TEXT_MESSAGE_LEN);
-		return 0;
+	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+		struct ast_json_error json_error;
+
+		json = ast_json_load_buf(buffer, strlen(buffer), &json_error);
+		if (!json) {
+			send_event(instance, ERROR, "Unable to parse JSON command");
+			return -1;
+		}
+		command = ast_json_object_string_get(json, "command");
+	} else {
+		command = buffer;
+		data = strchr(buffer, ' ');
+		if (data) {
+			*data = '\0';
+			data++;
+		}
 	}
-
-	/*
-	 * This is safe because the payload buffer is always >= 8K
-	 * even with LOW_MEMORY defined and we've already made sure the
-	 * command is less than 128 bytes.
-	 */
-	payload[payload_len] = '\0';
-	command = ast_strip(ast_strdupa(payload));
-
-	ast_debug(4, "%s: WebSocket %s command received\n",
-		ast_channel_name(instance->channel), command);
 
 	if (ast_strings_equal(command, ANSWER_CHANNEL)) {
 		ast_queue_control(instance->channel, AST_CONTROL_ANSWER);
 
 	} else if (ast_strings_equal(command, HANGUP_CHANNEL)) {
-		ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
+		websocket_request_hangup(instance, AST_CAUSE_NORMAL, AST_WEBSOCKET_STATUS_NORMAL);
 
 	} else if (ast_strings_equal(command, START_MEDIA_BUFFERING)) {
+		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
 		AST_LIST_LOCK(&instance->frame_queue);
 		instance->bulk_media_in_progress = 1;
 		AST_LIST_UNLOCK(&instance->frame_queue);
 
-	} else if (ast_begins_with(command, STOP_MEDIA_BUFFERING)) {
-		char *id;
+	} else if (ast_strings_equal(command, STOP_MEDIA_BUFFERING)) {
+		const char *id;
 		char *option;
 		SCOPED_LOCK(frame_queue_lock, &instance->frame_queue, AST_LIST_LOCK,
 			AST_LIST_UNLOCK);
 
-		id = ast_strip(command + strlen(STOP_MEDIA_BUFFERING));
+		if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+			id = ast_json_object_string_get(json, "correlation_id");
+		} else {
+			id = data;
+		}
+
+		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
 
 		ast_debug(4, "%s: WebSocket %s '%s' with %d bytes in leftover_data.\n",
 			ast_channel_name(instance->channel), STOP_MEDIA_BUFFERING, id,
@@ -462,16 +770,43 @@ static int process_text_message(struct websocket_pvt *instance,
 			}
 		}
 		instance->leftover_len = 0;
-		res = ast_asprintf(&option, "%s%s%s", MEDIA_BUFFERING_COMPLETED,
-			S_COR(!ast_strlen_zero(id), " ", ""), S_OR(id, ""));
-		if (res <= 0 || !option) {
-			return res;
+		option = create_event(instance, MEDIA_BUFFERING_COMPLETED, id);
+		if (!option) {
+			return -1;
+		}
+		res = queue_option_frame(instance, option);
+		ast_free(option);
+
+	} else if (ast_strings_equal(command, MARK_MEDIA)) {
+		const char *id;
+		char *option;
+		SCOPED_LOCK(frame_queue_lock, &instance->frame_queue, AST_LIST_LOCK,
+			AST_LIST_UNLOCK);
+
+		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
+
+		if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+			id = ast_json_object_string_get(json, "correlation_id");
+		} else {
+			id = data;
+		}
+
+		ast_debug(4, "%s: %s %s\n",
+			ast_channel_name(instance->channel), MARK_MEDIA, id);
+
+		option = create_event(instance, MEDIA_MARK_PROCESSED, id);
+		if (!option) {
+			return -1;
 		}
 		res = queue_option_frame(instance, option);
 		ast_free(option);
 
 	} else if (ast_strings_equal(command, FLUSH_MEDIA)) {
 		struct ast_frame *frame = NULL;
+
+		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+
 		AST_LIST_LOCK(&instance->frame_queue);
 		while ((frame = AST_LIST_REMOVE_HEAD(&instance->frame_queue, frame_list))) {
 			ast_frfree(frame);
@@ -481,41 +816,89 @@ static int process_text_message(struct websocket_pvt *instance,
 		instance->leftover_len = 0;
 		AST_LIST_UNLOCK(&instance->frame_queue);
 
-	} else if (ast_strings_equal(payload, REPORT_QUEUE_DRAINED)) {
+	} else if (ast_strings_equal(command, REPORT_QUEUE_DRAINED)) {
+		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+
 		AST_LIST_LOCK(&instance->frame_queue);
 		instance->report_queue_drained = 1;
 		AST_LIST_UNLOCK(&instance->frame_queue);
 
 	} else if (ast_strings_equal(command, GET_DRIVER_STATUS)) {
-		char *status = NULL;
+		return send_event(instance, STATUS);
 
-		res = ast_asprintf(&status, "%s queue_length:%d xon_level:%d xoff_level:%d queue_full:%s bulk_media:%s media_paused:%s",
-			DRIVER_STATUS,
-			instance->frame_queue_length, QUEUE_LENGTH_XON_LEVEL,
-			QUEUE_LENGTH_XOFF_LEVEL,
-			S_COR(instance->queue_full, "true", "false"),
-			S_COR(instance->bulk_media_in_progress, "true", "false"),
-			S_COR(instance->queue_paused, "true", "false")
-			);
-		if (res <= 0 || !status) {
-			ast_free(status);
-			res = -1;
-		} else {
-			ast_debug(4, "%s: WebSocket status: %s\n",
-				ast_channel_name(instance->channel), status);
-			res = ast_websocket_write_string(instance->websocket, status);
-			ast_free(status);
-		}
-
-	} else if (ast_strings_equal(payload, PAUSE_MEDIA)) {
+	} else if (ast_strings_equal(command, PAUSE_MEDIA)) {
+		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
 		AST_LIST_LOCK(&instance->frame_queue);
 		instance->queue_paused = 1;
 		AST_LIST_UNLOCK(&instance->frame_queue);
 
-	} else if (ast_strings_equal(payload, CONTINUE_MEDIA)) {
+	} else if (ast_strings_equal(command, CONTINUE_MEDIA)) {
+		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
 		AST_LIST_LOCK(&instance->frame_queue);
 		instance->queue_paused = 0;
 		AST_LIST_UNLOCK(&instance->frame_queue);
+
+	} else if (ast_strings_equal(command, SET_MEDIA_DIRECTION)) {
+		const char *direction;
+
+		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+
+		if (instance->control_msg_format != WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
+			send_event(instance, ERROR, "%s only supports JSON format.\n", command);
+			return 0;
+		}
+
+		direction = ast_json_object_string_get(json, "direction");
+		if (!direction) {
+			send_event(instance, ERROR, "%s requires a 'direction' parameter.\n", command);
+			return 0;
+		}
+
+		if (!strcmp("both", direction)) {
+			if (instance->media_direction == WEBCHAN_MEDIA_DIRECTION_BOTH) {
+				return 0;
+			}
+
+			if (!instance->timer) {
+				set_channel_timer(instance);
+				ast_queue_frame(instance->channel, &ast_null_frame);
+			}
+
+			instance->media_direction = WEBCHAN_MEDIA_DIRECTION_BOTH;
+
+		} else if (!strcmp("out", direction)) {
+			if (instance->media_direction == WEBCHAN_MEDIA_DIRECTION_OUT) {
+				return 0;
+			}
+
+			if (!instance->timer) {
+				set_channel_timer(instance);
+				ast_queue_frame(instance->channel, &ast_null_frame);
+			}
+
+			instance->media_direction = WEBCHAN_MEDIA_DIRECTION_OUT;
+
+		} else if (!strcmp("in", direction)) {
+			if (instance->media_direction == WEBCHAN_MEDIA_DIRECTION_IN) {
+				return 0;
+			}
+
+			if (instance->timer) {
+				ast_channel_internal_fd_clear(instance->channel, WS_TIMER_FDNO);
+				ast_timer_close(instance->timer);
+				instance->timer = NULL;
+				ast_queue_frame(instance->channel, &ast_null_frame);
+			}
+
+			instance->media_direction = WEBCHAN_MEDIA_DIRECTION_IN;
+
+		} else {
+			send_event(instance, ERROR, "'%s' is not a valid direction for %s.\n",
+				direction, command);
+			return 0;
+		}
 
 	} else {
 		ast_log(LOG_WARNING, "%s: WebSocket %s command unknown\n",
@@ -523,6 +906,39 @@ static int process_text_message(struct websocket_pvt *instance,
 	}
 
 	return res;
+}
+
+static int process_text_message(struct websocket_pvt *instance,
+	char *payload, uint64_t payload_len)
+{
+	char *command;
+
+	if (payload_len == 0) {
+		ast_log(LOG_WARNING, "%s: WebSocket TEXT message has 0 length\n",
+			ast_channel_name(instance->channel));
+		return 0;
+	}
+
+	if (payload_len > MAX_TEXT_MESSAGE_LEN) {
+		ast_log(LOG_WARNING, "%s: WebSocket TEXT message of length %d exceeds maximum length of %d\n",
+			ast_channel_name(instance->channel), (int)payload_len, MAX_TEXT_MESSAGE_LEN);
+		return 0;
+	}
+
+	/*
+	 * Unfortunately, payload is not NULL terminated even when it's
+	 * a TEXT frame so we need to allocate a new buffer, copy
+	 * the data into it, and NULL terminate it.
+	 */
+	command = ast_alloca(payload_len + 1);
+	memcpy(command, payload, payload_len); /* Safe */
+	command[payload_len] = '\0';
+	command = ast_strip(command);
+
+	ast_debug(4, "%s: Received: %s\n",
+		ast_channel_name(instance->channel), command);
+
+	return handle_command(instance, command);
 }
 
 static int process_binary_message(struct websocket_pvt *instance,
@@ -545,6 +961,11 @@ static int process_binary_message(struct websocket_pvt *instance,
 
 	next_frame_ptr = payload;
 	instance->bytes_read += payload_len;
+
+	if (instance->passthrough) {
+		res = queue_frame_from_buffer(instance, payload, payload_len);
+		return res;
+	}
 
 	if (instance->bulk_media_in_progress && instance->leftover_len > 0) {
 		/*
@@ -653,36 +1074,19 @@ static int read_from_ws_and_queue(struct websocket_pvt *instance)
 	int fragmented = 0;
 	int res = 0;
 
-	if (!instance || !instance->websocket) {
-		ast_log(LOG_WARNING, "%s: WebSocket instance not found\n",
-			ast_channel_name(instance->channel));
-		return -1;
-	}
-
-	ast_debug(9, "%s: Waiting for websocket to have data\n", ast_channel_name(instance->channel));
-	res = ast_wait_for_input(
-		ast_websocket_fd(instance->websocket), -1);
-	if (res <= 0) {
-		ast_log(LOG_WARNING, "%s: WebSocket read failed: %s\n",
-			ast_channel_name(instance->channel), strerror(errno));
-		return -1;
-	}
-
-	/*
-	 * We need to lock here to prevent the websocket handle from
-	 * being pulled out from under us if the core sends us a
-	 * hangup request.
-	 */
-	ao2_lock(instance);
 	if (!instance->websocket) {
-		ao2_unlock(instance);
+		ast_log(LOG_WARNING, "%s: WebSocket session not found\n",
+			ast_channel_name(instance->channel));
 		return -1;
 	}
 
 	res = ast_websocket_read(instance->websocket, &payload, &payload_len,
 		&opcode, &fragmented);
-	ao2_unlock(instance);
+
 	if (res) {
+		ast_debug(3, "%s: WebSocket read error\n",
+			ast_channel_name(instance->channel));
+		websocket_request_hangup(instance, AST_CAUSE_NETWORK_OUT_OF_ORDER, AST_WEBSOCKET_STATUS_GOING_AWAY);
 		return -1;
 	}
 	ast_debug(5, "%s: WebSocket read %d bytes\n", ast_channel_name(instance->channel),
@@ -692,78 +1096,89 @@ static int read_from_ws_and_queue(struct websocket_pvt *instance)
 		return process_text_message(instance, payload, payload_len);
 	}
 
+	if (opcode == AST_WEBSOCKET_OPCODE_PING || opcode == AST_WEBSOCKET_OPCODE_PONG) {
+		return 0;
+	}
+
 	if (opcode == AST_WEBSOCKET_OPCODE_CLOSE) {
-		ast_debug(5, "%s: WebSocket closed by remote\n",
+		ast_debug(3, "%s: WebSocket closed by remote\n",
 			ast_channel_name(instance->channel));
+		websocket_request_hangup(instance, AST_CAUSE_NORMAL, AST_WEBSOCKET_STATUS_GOING_AWAY);
 		return -1;
 	}
 
-	if (opcode != AST_WEBSOCKET_OPCODE_BINARY) {
-		ast_debug(5, "%s: WebSocket frame type %d not supported. Ignoring.\n",
+	if (opcode == AST_WEBSOCKET_OPCODE_BINARY) {
+		/* If the application's media direction is 'in', drop any media we receive from it */
+		if (instance->media_direction == WEBCHAN_MEDIA_DIRECTION_IN) {
+			ast_debug(5, "%s: WebSocket dropped frame (application media direction is 'in')\n",
+				ast_channel_name(instance->channel));
+			return 0;
+		}
+	} else {
+		ast_log(LOG_WARNING, "%s: WebSocket frame type %d not supported\n",
 			ast_channel_name(instance->channel), (int)opcode);
+		websocket_request_hangup(instance, AST_CAUSE_FAILURE, AST_WEBSOCKET_STATUS_UNSUPPORTED_DATA);
 		return 0;
 	}
 
 	return process_binary_message(instance, payload, payload_len);
 }
 
-/*!
- * \internal
- *
- * For incoming websocket connections, this function gets called by
- * incoming_ws_established_cb() and is run in the http server thread
- * handling the websocket connection.
- *
- * For outgoing websocket connections, this function gets started as
- * a background thread by webchan_call().
- */
-static void *read_thread_handler(void *obj)
+static int websocket_handoff_to_channel(struct websocket_pvt *instance)
 {
-	RAII_VAR(struct websocket_pvt *, instance, obj, ao2_cleanup);
-	RAII_VAR(char *, command, NULL, ast_free);
 	int res = 0;
+	int nodelay = 1;
+	struct ast_sockaddr *remote_addr = ast_websocket_remote_address(instance->websocket);
 
-	ast_debug(3, "%s: Read thread started\n", ast_channel_name(instance->channel));
+	instance->remote_addr = ast_strdup(ast_sockaddr_stringify(remote_addr));
+	ast_debug(3, "%s: WebSocket connection with %s established\n",
+		ast_channel_name(instance->channel), instance->remote_addr);
 
-	/*
-	 * We need to tell the remote app what channel this media is for.
-	 * This is especially important for outbound connections otherwise
-	 * the app won't know who the media is for.
-	 */
-	res = ast_asprintf(&command, "%s connection_id:%s channel:%s format:%s optimal_frame_size:%d", MEDIA_START,
-		instance->connection_id, ast_channel_name(instance->channel),
-		ast_format_get_name(instance->native_format),
-		instance->optimal_frame_size);
-	if (res <= 0 || !command) {
-		ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
-		ast_log(LOG_ERROR, "%s: Failed to create MEDIA_START\n", ast_channel_name(instance->channel));
-		return NULL;
+	if (setsockopt(ast_websocket_fd(instance->websocket),
+		IPPROTO_TCP, TCP_NODELAY, (char *) &nodelay, sizeof(nodelay)) < 0) {
+		ast_log(LOG_WARNING, "Failed to set TCP_NODELAY on websocket connection: %s\n", strerror(errno));
 	}
-	res = ast_websocket_write_string(instance->websocket, command);
-	if (res != 0) {
-		ast_log(LOG_ERROR, "%s: Failed to send MEDIA_START\n", ast_channel_name(instance->channel));
-		ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
-		return NULL;
+
+	ast_channel_set_fd(instance->channel, WS_WEBSOCKET_FDNO, ast_websocket_fd(instance->websocket));
+
+	res = send_event(instance, MEDIA_START);
+	if (res != 0 ) {
+		if (instance->type == AST_WS_TYPE_SERVER) {
+			websocket_request_hangup(instance, AST_CAUSE_NETWORK_OUT_OF_ORDER, AST_WEBSOCKET_STATUS_GOING_AWAY);
+		} else {
+			/*
+			 * We were called by webchan_call so just need to set causes.
+			 * The core will hangup the channel.
+			 */
+			ast_channel_tech_hangupcause_set(instance->channel, AST_WEBSOCKET_STATUS_GOING_AWAY);
+			ast_channel_hangupcause_set(instance->channel, AST_CAUSE_NETWORK_OUT_OF_ORDER);
+		}
+		return -1;
 	}
-	ast_debug(3, "%s: Sent %s\n", ast_channel_name(instance->channel),
-		command);
 
 	if (!instance->no_auto_answer) {
 		ast_debug(3, "%s: ANSWER by auto_answer\n", ast_channel_name(instance->channel));
 		ast_queue_control(instance->channel, AST_CONTROL_ANSWER);
 	}
 
-	while (read_from_ws_and_queue(instance) == 0)
-	{
+	return 0;
+}
+
+static void _websocket_request_hangup(struct websocket_pvt *instance, int ast_cause,
+	enum ast_websocket_status_code tech_cause, int line, const char *function)
+{
+	if (!instance || !instance->channel) {
+		return;
 	}
+	ast_debug(3, "%s:%s: Hangup requested from %s line %d.  cause: %s(%d)  tech_cause: %s(%d)",
+		ast_channel_name(instance->channel), instance->remote_addr,
+		function, line,
+		ast_cause2str(ast_cause), ast_cause, ast_websocket_status_to_str(tech_cause), tech_cause);
 
-	/*
-	 * websocket_hangup will take care of closing the websocket if needed.
-	 */
-	ast_debug(3, "%s: HANGUP by websocket close/error\n", ast_channel_name(instance->channel));
-	ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
-
-	return NULL;
+	if (tech_cause) {
+		ast_channel_tech_hangupcause_set(instance->channel, tech_cause);
+	}
+	ast_queue_hangup_with_cause(instance->channel, ast_cause);
 }
 
 /*! \brief Function called when we should write a frame to the channel */
@@ -777,14 +1192,25 @@ static int webchan_write(struct ast_channel *ast, struct ast_frame *f)
 		return -1;
 	}
 
+	/* The app doesn't want media right now */
+	if (instance->media_direction == WEBCHAN_MEDIA_DIRECTION_OUT) {
+		return 0;
+	}
+
+	if (f->frametype == AST_FRAME_CNG) {
+		return 0;
+	}
+
 	if (f->frametype != AST_FRAME_VOICE) {
 		ast_log(LOG_WARNING, "%s: This WebSocket channel only supports AST_FRAME_VOICE frames\n",
 			ast_channel_name(ast));
-		return -1;
+		return 0;
 	}
-	if (f->subclass.format != instance->native_format) {
-		ast_log(LOG_WARNING, "%s: This WebSocket channel only supports the '%s' format\n",
-			ast_channel_name(ast), ast_format_get_name(instance->native_format));
+
+	if (ast_format_cmp(f->subclass.format, instance->native_format) == AST_FORMAT_CMP_NOT_EQUAL) {
+		ast_log(LOG_WARNING, "%s: This WebSocket channel only supports the '%s' format, not '%s'\n",
+			ast_channel_name(ast), ast_format_get_name(instance->native_format),
+			ast_format_get_name(f->subclass.format));
 		return -1;
 	}
 
@@ -796,17 +1222,19 @@ static int webchan_write(struct ast_channel *ast, struct ast_frame *f)
  * \internal
  *
  * Called by the core to actually call the remote.
+ * The core will hang up the channel if a non-zero  is returned.
+ * We just need to set hangup causes if appropriate.
  */
 static int webchan_call(struct ast_channel *ast, const char *dest,
 	int timeout)
 {
 	struct websocket_pvt *instance = ast_channel_tech_pvt(ast);
-	int nodelay = 1;
 	enum ast_websocket_result result;
 
 	if (!instance) {
 		ast_log(LOG_WARNING, "%s: WebSocket instance not found\n",
 			ast_channel_name(ast));
+		ast_channel_hangupcause_set(ast, AST_CAUSE_FAILURE);
 		return -1;
 	}
 
@@ -819,37 +1247,27 @@ static int webchan_call(struct ast_channel *ast, const char *dest,
 	if (!instance->client) {
 		ast_log(LOG_WARNING, "%s: WebSocket client not found\n",
 			ast_channel_name(ast));
+		ast_channel_hangupcause_set(ast, AST_CAUSE_FAILURE);
 		return -1;
 	}
 
 	ast_debug(3, "%s: WebSocket call requested to %s. cid: %s\n",
 		ast_channel_name(ast), dest, instance->connection_id);
 
+	if (!ast_strlen_zero(instance->uri_params)) {
+		ast_websocket_client_add_uri_params(instance->client, instance->uri_params);
+	}
+
 	instance->websocket = ast_websocket_client_connect(instance->client,
 		instance, ast_channel_name(ast), &result);
 	if (!instance->websocket || result != WS_OK) {
 		ast_log(LOG_WARNING, "%s: WebSocket connection failed to %s: %s\n",
 			ast_channel_name(ast), dest, ast_websocket_result_to_str(result));
+		ast_channel_hangupcause_set(ast, AST_CAUSE_NO_ROUTE_DESTINATION);
 		return -1;
 	}
 
-	if (setsockopt(ast_websocket_fd(instance->websocket),
-		IPPROTO_TCP, TCP_NODELAY, (char *) &nodelay, sizeof(nodelay)) < 0) {
-		ast_log(LOG_WARNING, "Failed to set TCP_NODELAY on websocket connection: %s\n", strerror(errno));
-	}
-
-	ast_debug(3, "%s: WebSocket connection to %s established\n",
-		ast_channel_name(ast), dest);
-
-	/* read_thread_handler() will clean up the bump */
-	if (ast_pthread_create_detached_background(&instance->outbound_read_thread, NULL,
-			read_thread_handler, ao2_bump(instance))) {
-		ast_log(LOG_WARNING, "%s: Failed to create thread.\n", ast_channel_name(ast));
-		ao2_cleanup(instance);
-		return -1;
-	}
-
-	return 0;
+	return websocket_handoff_to_channel(instance);
 }
 
 static void websocket_destructor(void *data)
@@ -887,26 +1305,13 @@ static void websocket_destructor(void *data)
 	ao2_cleanup(instance->native_format);
 	instance->native_format = NULL;
 
-	ao2_cleanup(instance->slin_codec);
-	instance->slin_codec = NULL;
-
-	ao2_cleanup(instance->slin_format);
-	instance->slin_format = NULL;
-
-	if (instance->silence.data.ptr) {
-		ast_free(instance->silence.data.ptr);
-		instance->silence.data.ptr = NULL;
-	}
-
-	if (instance->translator) {
-		ast_translator_free_path(instance->translator);
-		instance->translator = NULL;
-	}
-
 	if (instance->leftover_data) {
 		ast_free(instance->leftover_data);
 		instance->leftover_data = NULL;
 	}
+
+	ast_free(instance->uri_params);
+	ast_free(instance->remote_addr);
 }
 
 struct instance_proxy {
@@ -977,14 +1382,35 @@ static struct websocket_pvt* websocket_new(const char *chan_name,
 	 * References for native_format and native_codec are now held by the
 	 * instance and will be released when the instance is destroyed.
 	 */
-	instance->optimal_frame_size =
-		(instance->native_codec->default_ms * instance->native_codec->minimum_bytes)
-			/ instance->native_codec->minimum_ms;
 
-	instance->leftover_data = ast_calloc(1, instance->optimal_frame_size);
-	if (!instance->leftover_data) {
-		return NULL;
+	/*
+	 * It's not possible for us to re-time or re-frame media if the data
+	 * stream can't be broken up on arbitrary byte boundaries.  This is usually
+	 * indicated by the codec's minimum_bytes being small (10 bytes or less).
+	 * We need to force passthrough mode in this case.
+	 */
+	if (instance->native_codec->minimum_bytes <= 10) {
+		instance->passthrough = 1;
+		instance->optimal_frame_size = 0;
+	} else {
+		instance->optimal_frame_size =
+			(instance->native_codec->default_ms * instance->native_codec->minimum_bytes)
+				/ instance->native_codec->minimum_ms;
+		instance->leftover_data = ast_calloc(1, instance->optimal_frame_size);
+		if (!instance->leftover_data) {
+			return NULL;
+		}
 	}
+
+	ast_debug(3,
+		"%s: WebSocket channel native format '%s' Sample rate: %d ptime: %dms minms: %u  minbytes: %u passthrough: %d optimal_frame_size: %d\n",
+		chan_name, ast_format_get_name(instance->native_format),
+		ast_format_get_sample_rate(instance->native_format),
+		ast_format_get_default_ms(instance->native_format),
+		ast_format_get_minimum_ms(instance->native_format),
+		ast_format_get_minimum_bytes(instance->native_format),
+		instance->passthrough,
+		instance->optimal_frame_size);
 
 	/* We have exclusive access to proxy and sorcery, no need for locking here. */
 	if (ao2_weakproxy_set_object(proxy, instance, OBJ_NOLOCK)) {
@@ -1005,60 +1431,6 @@ static struct websocket_pvt* websocket_new(const char *chan_name,
 	return ao2_bump(instance);
 }
 
-static int set_instance_translator(struct websocket_pvt *instance)
-{
-	if (ast_format_cache_is_slinear(instance->native_format)) {
-		instance->slin_format = ao2_bump(instance->native_format);
-		instance->slin_codec = ast_format_get_codec(instance->slin_format);
-		return 0;
-	}
-
-	instance->slin_format = ao2_bump(ast_format_cache_get_slin_by_rate(instance->native_codec->sample_rate));
-	if (!instance->slin_format) {
-		ast_log(LOG_ERROR, "%s: Unable to get slin format for rate %d\n",
-			ast_channel_name(instance->channel), instance->native_codec->sample_rate);
-		return -1;
-	}
-	ast_debug(3, "%s: WebSocket channel slin format '%s' Sample rate: %d ptime: %dms\n",
-		ast_channel_name(instance->channel), ast_format_get_name(instance->slin_format),
-		ast_format_get_sample_rate(instance->slin_format),
-		ast_format_get_default_ms(instance->slin_format));
-
-	instance->translator = ast_translator_build_path(instance->slin_format, instance->native_format);
-	if (!instance->translator) {
-		ast_log(LOG_ERROR, "%s: Unable to build translator path from '%s' to '%s'\n",
-			ast_channel_name(instance->channel), ast_format_get_name(instance->native_format),
-			ast_format_get_name(instance->slin_format));
-		return -1;
-	}
-
-	instance->slin_codec = ast_format_get_codec(instance->slin_format);
-	return 0;
-}
-
-static int set_instance_silence_frame(struct websocket_pvt *instance)
-{
-	instance->silence.frametype = AST_FRAME_VOICE;
-	instance->silence.datalen =
-		(instance->slin_codec->default_ms * instance->slin_codec->minimum_bytes) / instance->slin_codec->minimum_ms;
-	instance->silence.samples = instance->silence.datalen / sizeof(uint16_t);
-	/*
-	 * Even though we'll calloc the data pointer, we don't mark it as
-	 * mallocd because this frame will be around for a while and we don't
-	 * want it accidentally freed before we're done with it.
-	 */
-	instance->silence.mallocd = 0;
-	instance->silence.offset = 0;
-	instance->silence.src = __PRETTY_FUNCTION__;
-	instance->silence.subclass.format = instance->slin_format;
-	instance->silence.data.ptr = ast_calloc(1, instance->silence.datalen);
-	if (!instance->silence.data.ptr) {
-		return -1;
-	}
-
-	return 0;
-}
-
 static int set_channel_timer(struct websocket_pvt *instance)
 {
 	int rate = 0;
@@ -1075,7 +1447,7 @@ static int set_channel_timer(struct websocket_pvt *instance)
 	 * Calling ast_channel_set_fd will cause the channel thread to call
 	 * webchan_read at 'rate' times per second.
 	 */
-	ast_channel_set_fd(instance->channel, 0, ast_timer_fd(instance->timer));
+	ast_channel_set_fd(instance->channel, WS_TIMER_FDNO, ast_timer_fd(instance->timer));
 
 	return 0;
 }
@@ -1097,20 +1469,59 @@ static int set_channel_variables(struct websocket_pvt *instance)
 	return 0;
 }
 
+static int validate_uri_parameters(const char *uri_params)
+{
+	char *params = ast_strdupa(uri_params);
+	char *nvp = NULL;
+	char *nv = NULL;
+
+	/*
+	 * uri_params should be a comma-separated list of key=value pairs.
+	 * For example:
+	 * name1=value1,name2=value2
+	 * We're verifying that each name and value either doesn't need
+	 * to be encoded or that it already is.
+	 */
+
+	while((nvp = ast_strsep(&params, ',', 0))) {
+		/* nvp will be name1=value1 */
+		while((nv = ast_strsep(&nvp, '=', 0))) {
+			/* nv will be either name1 or value1 */
+			if (!ast_uri_verify_encoded(nv)) {
+				return 0;
+			}
+		}
+	}
+
+	return 1;
+}
+
 enum {
 	OPT_WS_CODEC =  (1 << 0),
 	OPT_WS_NO_AUTO_ANSWER =  (1 << 1),
+	OPT_WS_URI_PARAM =  (1 << 2),
+	OPT_WS_PASSTHROUGH =  (1 << 3),
+	OPT_WS_MSG_FORMAT =  (1 << 4),
+	OPT_WS_MEDIA_DIRECTION = (1 << 5),
 };
 
 enum {
 	OPT_ARG_WS_CODEC,
 	OPT_ARG_WS_NO_AUTO_ANSWER,
+	OPT_ARG_WS_URI_PARAM,
+	OPT_ARG_WS_PASSTHROUGH,
+	OPT_ARG_WS_MSG_FORMAT,
+	OPT_ARG_WS_MEDIA_DIRECTION,
 	OPT_ARG_ARRAY_SIZE
 };
 
 AST_APP_OPTIONS(websocket_options, BEGIN_OPTIONS
 	AST_APP_OPTION_ARG('c', OPT_WS_CODEC, OPT_ARG_WS_CODEC),
 	AST_APP_OPTION('n', OPT_WS_NO_AUTO_ANSWER),
+	AST_APP_OPTION_ARG('v', OPT_WS_URI_PARAM, OPT_ARG_WS_URI_PARAM),
+	AST_APP_OPTION('p', OPT_WS_PASSTHROUGH),
+	AST_APP_OPTION_ARG('f', OPT_WS_MSG_FORMAT, OPT_ARG_WS_MSG_FORMAT),
+	AST_APP_OPTION_ARG('d', OPT_WS_MEDIA_DIRECTION, OPT_ARG_WS_MEDIA_DIRECTION),
 	END_OPTIONS );
 
 static struct ast_channel *webchan_request(const char *type,
@@ -1128,7 +1539,11 @@ static struct ast_channel *webchan_request(const char *type,
 	);
 	struct ast_flags opts = { 0, };
 	char *opt_args[OPT_ARG_ARRAY_SIZE];
-	const char *requestor_name = requestor ? ast_channel_name(requestor) : "no channel";
+	const char *requestor_name = requestor ? ast_channel_name(requestor) :
+		(assignedids && !ast_strlen_zero(assignedids->uniqueid) ? assignedids->uniqueid : "<unknown>");
+	RAII_VAR(struct webchan_conf_global *, global_cfg, NULL, ao2_cleanup);
+
+	global_cfg = ast_sorcery_retrieve_by_id(sorcery, "global", "global");
 
 	ast_debug(3, "%s: WebSocket channel requested\n",
 		requestor_name);
@@ -1157,16 +1572,12 @@ static struct ast_channel *webchan_request(const char *type,
 
 	if (ast_test_flag(&opts, OPT_WS_CODEC)
 		&& !ast_strlen_zero(opt_args[OPT_ARG_WS_CODEC])) {
-		ast_debug(3, "%s: Using specified format %s\n",
-			requestor_name, opt_args[OPT_ARG_WS_CODEC]);
 		fmt = ast_format_cache_get(opt_args[OPT_ARG_WS_CODEC]);
 	} else {
 		/*
 		 * If codec wasn't specified in the dial string,
 		 * use the first format in the capabilities.
 		 */
-		ast_debug(3, "%s: Using format %s from requesting channel\n",
-			requestor_name, opt_args[OPT_ARG_WS_CODEC]);
 		fmt = ast_format_cap_get_format(cap, 0);
 	}
 
@@ -1176,6 +1587,10 @@ static struct ast_channel *webchan_request(const char *type,
 		goto failure;
 	}
 
+	ast_debug(3, "%s: Using format %s from %s\n",
+		requestor_name, ast_format_get_name(fmt),
+		ast_test_flag(&opts, OPT_WS_CODEC) ? "dialstring" : "requester");
+
 	instance = websocket_new(requestor_name, args.connection_id, fmt);
 	if (!instance) {
 		ast_log(LOG_ERROR, "%s: Failed to allocate WebSocket channel pvt\n",
@@ -1183,7 +1598,75 @@ static struct ast_channel *webchan_request(const char *type,
 		goto failure;
 	}
 
+	instance->media_direction = WEBCHAN_MEDIA_DIRECTION_BOTH;
+	if (ast_test_flag(&opts, OPT_WS_MEDIA_DIRECTION)) {
+		if (!strcmp("both", opt_args[OPT_ARG_WS_MEDIA_DIRECTION])) {
+			/* The default. Don't need to do anything here other than
+			 * ensure it is an allowed value. */
+		} else if (!strcmp("out", opt_args[OPT_ARG_WS_MEDIA_DIRECTION])) {
+			instance->media_direction = WEBCHAN_MEDIA_DIRECTION_OUT;
+		} else if (!strcmp("in", opt_args[OPT_ARG_WS_MEDIA_DIRECTION])) {
+			instance->media_direction = WEBCHAN_MEDIA_DIRECTION_IN;
+		} else {
+			ast_log(LOG_ERROR, "Unrecognized option for media direction: '%s'.\n",
+				opt_args[OPT_ARG_WS_MEDIA_DIRECTION]);
+			goto failure;
+		}
+	}
+
 	instance->no_auto_answer = ast_test_flag(&opts, OPT_WS_NO_AUTO_ANSWER);
+	if (!instance->passthrough) {
+		instance->passthrough = ast_test_flag(&opts, OPT_WS_PASSTHROUGH);
+	}
+
+	if (ast_test_flag(&opts, OPT_WS_URI_PARAM)
+		&& !ast_strlen_zero(opt_args[OPT_ARG_WS_URI_PARAM])) {
+		char *comma;
+
+		if (ast_strings_equal(args.connection_id, INCOMING_CONNECTION_ID)) {
+			ast_log(LOG_ERROR,
+				"%s: URI parameters are not allowed for 'WebSocket/INCOMING' channels\n",
+				requestor_name);
+			goto failure;
+		}
+
+		ast_debug(3, "%s: Using URI parameters '%s'\n",
+			requestor_name, opt_args[OPT_ARG_WS_URI_PARAM]);
+
+		if (!validate_uri_parameters(opt_args[OPT_ARG_WS_URI_PARAM])) {
+			ast_log(LOG_ERROR, "%s: Invalid URI parameters '%s' in WebSocket/%s dial string\n",
+				requestor_name, opt_args[OPT_ARG_WS_URI_PARAM],
+				args.connection_id);
+			goto failure;
+		}
+
+		instance->uri_params = ast_strdup(opt_args[OPT_ARG_WS_URI_PARAM]);
+		comma = instance->uri_params;
+		/*
+		 * The normal separator for query string components is an
+		 * ampersand ('&') but the Dial app interprets them as additional
+		 * channels to dial in parallel so we instruct users to separate
+		 * the parameters with commas (',') instead.  We now have to
+		 * convert those commas back to ampersands.
+		 */
+		while ((comma = strchr(comma,','))) {
+			*comma = '&';
+		}
+		ast_debug(3, "%s: Using final URI '%s'\n", requestor_name, instance->uri_params);
+	}
+
+	if (ast_test_flag(&opts, OPT_WS_MSG_FORMAT)) {
+		instance->control_msg_format = control_msg_format_from_str(opt_args[OPT_ARG_WS_MSG_FORMAT]);
+
+		if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_INVALID) {
+			ast_log(LOG_WARNING, "%s: 'f/control message format' dialstring parameter value missing or invalid. "
+				"Defaulting to 'plain-text'\n",
+				ast_channel_name(requestor));
+			instance->control_msg_format = WEBCHAN_CONTROL_MSG_FORMAT_PLAIN;
+		}
+	} else if (global_cfg) {
+		instance->control_msg_format = global_cfg->control_msg_format;
+	}
 
 	chan = ast_channel_alloc(1, AST_STATE_DOWN, "", "", "", "", "", assignedids,
 		requestor, 0, "WebSocket/%s/%p", args.connection_id, instance);
@@ -1192,6 +1675,8 @@ static struct ast_channel *webchan_request(const char *type,
 		goto failure;
 	}
 
+	/* Prevent device state caching as this channel involves ephemeral destinations or sources */
+	ast_set_flag(ast_channel_flags(chan), AST_FLAG_DISABLE_DEVSTATE_CACHE);
 	ast_debug(3, "%s: WebSocket channel %s allocated for connection %s\n",
 		ast_channel_name(chan), requestor_name,
 		instance->connection_id);
@@ -1199,15 +1684,9 @@ static struct ast_channel *webchan_request(const char *type,
 	instance->channel = ao2_bump(chan);
 	ast_channel_tech_set(instance->channel, &websocket_tech);
 
-	if (set_instance_translator(instance) != 0) {
-		goto failure;
-	}
-
-	if (set_instance_silence_frame(instance) != 0) {
-		goto failure;
-	}
-
-	if (set_channel_timer(instance) != 0) {
+	/* If the application's media direction is 'both' or 'out', we need the channel timer. */
+	if (instance->media_direction != WEBCHAN_MEDIA_DIRECTION_IN
+		&& set_channel_timer(instance) != 0) {
 		goto failure;
 	}
 
@@ -1244,7 +1723,6 @@ failure:
 	return NULL;
 }
 
-
 /*!
  * \internal
  *
@@ -1260,25 +1738,28 @@ static int webchan_hangup(struct ast_channel *ast)
 	ast_debug(3, "%s: WebSocket call hangup. cid: %s\n",
 		ast_channel_name(ast), instance->connection_id);
 
-	/*
-	 * We need to lock because read_from_ws_and_queue() is probably waiting
-	 * on the websocket file descriptor and will unblock and immediately try to
-	 * check the websocket and read from it. We don't want to pull the
-	 * websocket out from under it between the check and read.
-	 */
-	ao2_lock(instance);
 	if (instance->websocket) {
-		ast_websocket_close(instance->websocket, 1000);
+		ast_websocket_close(instance->websocket, ast_channel_tech_hangupcause(ast) ?: 1000);
 		ast_websocket_unref(instance->websocket);
 		instance->websocket = NULL;
 	}
 	ast_channel_tech_pvt_set(ast, NULL);
-	ao2_unlock(instance);
 
 	/* Clean up the reference from adding the instance to the channel */
 	ao2_cleanup(instance);
 
 	return 0;
+}
+
+static int webchan_send_dtmf_text(struct ast_channel *ast, char digit, unsigned int duration)
+{
+	struct websocket_pvt *instance = ast_channel_tech_pvt(ast);
+
+	if (!instance) {
+		return -1;
+	}
+
+	return send_event(instance, DTMF_END, digit);
 }
 
 /*!
@@ -1297,7 +1778,6 @@ static void incoming_ws_established_cb(struct ast_websocket *ast_ws_session,
 	struct ast_variable *v;
 	const char *connection_id = NULL;
 	struct websocket_pvt *instance = NULL;
-	int nodelay = 1;
 
 	ast_debug(3, "WebSocket established\n");
 
@@ -1317,8 +1797,8 @@ static void incoming_ws_established_cb(struct ast_websocket *ast_ws_session,
 		 * Just in case though...
 		 */
 		ast_log(LOG_WARNING, "WebSocket connection id not found\n");
-		ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
-		ast_websocket_close(ast_ws_session, 1000);
+		websocket_request_hangup(instance, AST_CAUSE_FAILURE, AST_WEBSOCKET_STATUS_INTERNAL_ERROR);
+		ast_websocket_close(ast_ws_session, AST_WEBSOCKET_STATUS_INTERNAL_ERROR);
 		return;
 	}
 
@@ -1330,22 +1810,18 @@ static void incoming_ws_established_cb(struct ast_websocket *ast_ws_session,
 		 * Just in case though...
 		 */
 		ast_log(LOG_WARNING, "%s: WebSocket instance not found\n", connection_id);
-		ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
-		ast_websocket_close(ast_ws_session, 1000);
+		websocket_request_hangup(instance, AST_CAUSE_FAILURE, AST_WEBSOCKET_STATUS_INTERNAL_ERROR);
+		ast_websocket_close(ast_ws_session, AST_WEBSOCKET_STATUS_INTERNAL_ERROR);
 		return;
 	}
 	instance->websocket = ao2_bump(ast_ws_session);
 
-	if (setsockopt(ast_websocket_fd(instance->websocket),
-		IPPROTO_TCP, TCP_NODELAY, (char *) &nodelay, sizeof(nodelay)) < 0) {
-		ast_log(LOG_WARNING, "Failed to set TCP_NODELAY on manager connection: %s\n", strerror(errno));
-	}
-
-	/* read_thread_handler cleans up the bump */
-	read_thread_handler(ao2_bump(instance));
-
+	websocket_handoff_to_channel(instance);
 	ao2_cleanup(instance);
-	ast_debug(3, "WebSocket closed\n");
+	/*
+	 * The instance is the channel's responsibility now.
+	 * We just return here.
+	 */
 }
 
 /*!
@@ -1442,6 +1918,85 @@ static struct ast_http_uri http_uri = {
 	.no_decode_uri = 1,
 };
 
+AO2_STRING_FIELD_HASH_FN(instance_proxy, connection_id)
+AO2_STRING_FIELD_CMP_FN(instance_proxy, connection_id)
+AO2_STRING_FIELD_SORT_FN(instance_proxy, connection_id)
+
+static int global_control_message_format_from_str(const struct aco_option *opt,
+	struct ast_variable *var, void *obj)
+{
+	struct webchan_conf_global *cfg = obj;
+
+	cfg->control_msg_format = control_msg_format_from_str(var->value);
+
+	if (cfg->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_INVALID) {
+		ast_log(LOG_ERROR, "chan_websocket.conf: Invalid value '%s' for "
+			"control_mesage_format. Must be 'plain-text' or 'json'\n",
+			var->value);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int global_control_message_format_to_str(const void *obj, const intptr_t *args, char **buf)
+{
+	const struct webchan_conf_global *cfg = obj;
+
+	*buf = ast_strdup(control_msg_format_to_str(cfg->control_msg_format));
+
+	return 0;
+}
+
+static void *global_alloc(const char *name)
+{
+	struct webchan_conf_global *cfg = ast_sorcery_generic_alloc(
+		sizeof(*cfg), NULL);
+
+	if (!cfg) {
+		return NULL;
+	}
+
+	return cfg;
+}
+
+static int global_apply(const struct ast_sorcery *sorcery, void *obj)
+{
+	struct webchan_conf_global *cfg = obj;
+
+	ast_debug(1, "control_msg_format: %s\n",
+		control_msg_format_to_str(cfg->control_msg_format));
+
+	return 0;
+}
+
+static int load_config(void)
+{
+	ast_debug(2, "Initializing Websocket Client Configuration\n");
+	sorcery = ast_sorcery_open();
+	if (!sorcery) {
+		ast_log(LOG_ERROR, "Failed to open sorcery\n");
+		return -1;
+	}
+
+	ast_sorcery_apply_default(sorcery, "global", "config",
+		"chan_websocket.conf,criteria=type=global,single_object=yes,explicit_name=global");
+
+	if (ast_sorcery_object_register(sorcery, "global", global_alloc, NULL, global_apply)) {
+		ast_log(LOG_ERROR, "Failed to register chan_websocket global object with sorcery\n");
+		ast_sorcery_unref(sorcery);
+		sorcery = NULL;
+		return -1;
+	}
+
+	ast_sorcery_object_field_register_nodoc(sorcery, "global", "type", "", OPT_NOOP_T, 0, 0);
+	ast_sorcery_register_cust(global, control_message_format, "plain-text");
+
+	ast_sorcery_load(sorcery);
+
+	return 0;
+}
+
 /*! \brief Function called when our module is unloaded */
 static int unload_module(void)
 {
@@ -1456,18 +2011,30 @@ static int unload_module(void)
 	ao2_cleanup(instances);
 	instances = NULL;
 
+	ast_sorcery_unref(sorcery);
+	sorcery = NULL;
+
 	return 0;
 }
 
-AO2_STRING_FIELD_HASH_FN(instance_proxy, connection_id)
-AO2_STRING_FIELD_CMP_FN(instance_proxy, connection_id)
-AO2_STRING_FIELD_SORT_FN(instance_proxy, connection_id)
+static int reload_module(void)
+{
+	ast_debug(2, "Reloading chan_websocket configuration\n");
+	ast_sorcery_reload(sorcery);
+
+	return 0;
+}
 
 /*! \brief Function called when our module is loaded */
 static int load_module(void)
 {
 	int res = 0;
 	struct ast_websocket_protocol *protocol;
+
+	res = load_config();
+	if (res != 0) {
+		return AST_MODULE_LOAD_DECLINE;
+	}
 
 	if (!(websocket_tech.capabilities = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT))) {
 		return AST_MODULE_LOAD_DECLINE;
@@ -1513,6 +2080,7 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "Websocket Media Chann
 	.support_level = AST_MODULE_SUPPORT_CORE,
 	.load = load_module,
 	.unload = unload_module,
+	.reload = reload_module,
 	.load_pri = AST_MODPRI_CHANNEL_DRIVER,
 	.requires = "res_http_websocket,res_websocket_client",
 );

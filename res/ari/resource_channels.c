@@ -401,6 +401,26 @@ void ast_ari_channels_ring_stop(struct ast_variable *headers,
 	ast_ari_response_no_content(response);
 }
 
+void ast_ari_channels_progress(struct ast_variable *headers,
+	struct ast_ari_channels_progress_args *args,
+	struct ast_ari_response *response)
+{
+	RAII_VAR(struct stasis_app_control *, control, NULL, ao2_cleanup);
+
+	control = find_control(response, args->channel_id);
+	if (control == NULL) {
+		return;
+	}
+
+	if (channel_state_invalid(control, response)) {
+		return;
+	}
+
+	stasis_app_control_progress(control);
+
+	ast_ari_response_no_content(response);
+}
+
 void ast_ari_channels_mute(struct ast_variable *headers,
 	struct ast_ari_channels_mute_args *args,
 	struct ast_ari_response *response)
@@ -2142,11 +2162,6 @@ static int external_media_audiosocket_tcp(struct ast_ari_channels_external_media
 	struct ast_channel *chan;
 	struct varshead *vars;
 
-	if (ast_strlen_zero(args->data)) {
-		ast_ari_response_error(response, 400, "Bad Request", "data can not be empty");
-		return 1;
-	}
-
 	if (ast_asprintf(&endpoint, "AudioSocket/%s/%s",
 		args->external_host, args->data) == -1) {
 		return 1;
@@ -2192,10 +2207,21 @@ static int external_media_websocket(struct ast_ari_channels_external_media_args 
 	char *endpoint;
 	struct ast_channel *chan;
 	struct varshead *vars;
+	char direction[16] = "";
 
-	if (ast_asprintf(&endpoint, "WebSocket/%s/c(%s)",
+	/* If direction is set here, it WILL override any m() line in transport data
+	 * since it is appended to the end of the string.
+	 */
+	if (args->direction) {
+		snprintf(direction, sizeof(direction), "d(%s)", args->direction);
+	}
+
+	if (ast_asprintf(&endpoint, "WebSocket/%s%s%s%s%s",
 			args->external_host,
-			args->format) == -1) {
+			S_COR(args->transport_data, "/", ""),
+			S_OR(args->transport_data, ""),
+			S_COR(!args->transport_data && args->direction, "/", ""),
+			direction) == -1) {
 		return 1;
 	}
 
@@ -2333,8 +2359,14 @@ void ast_ari_channels_external_media(struct ast_variable *headers,
 		return;
 	}
 
-	if (ast_strlen_zero(args->direction)) {
-		args->direction = "both";
+	if (!ast_strlen_zero(args->direction)) {
+		if (strcmp(args->direction, "both") && strcmp(args->direction, "in")
+			&& strcmp(args->direction, "out")) {
+			ast_ari_response_error(
+				response, 400, "Bad Request",
+				"Invalid direction specified");
+			return;
+		}
 	}
 
 	if (strcasecmp(args->encapsulation, "rtp") == 0 && strcasecmp(args->transport, "udp") == 0) {
@@ -2344,7 +2376,9 @@ void ast_ari_channels_external_media(struct ast_variable *headers,
 				"An internal error prevented this request from being handled");
 		}
 	} else if (strcasecmp(args->encapsulation, "audiosocket") == 0 && strcasecmp(args->transport, "tcp") == 0) {
-		if (external_media_audiosocket_tcp(args, variables, response)) {
+		if (ast_strlen_zero(args->data)) {
+			ast_ari_response_error(response, 400, "Bad Request", "data can not be empty");
+		} else if (external_media_audiosocket_tcp(args, variables, response)) {
 			ast_ari_response_error(
 				response, 500, "Internal Server Error",
 				"An internal error prevented this request from being handled");
